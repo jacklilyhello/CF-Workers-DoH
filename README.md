@@ -12,7 +12,7 @@ CF-Workers-DoH 是一个基于 Cloudflare Workers 构建的 DNS over HTTPS (DoH)
 - **Git 连接部署**：Cloudflare Worker 已连接仓库时，可使用：
 
 ```bash
-npx wrangler deploy _worker.js --name dns-doh --keep-vars --compatibility-date 2026-06-25
+npx wrangler deploy _worker.js --name dns --keep-vars --compatibility-date 2026-06-25
 ```
 
 ## 🔐 推荐个人部署变量

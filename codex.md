@@ -33,3 +33,11 @@
 - 测试情况：已运行 `node --check _worker.js`、`node --check scripts/test_doh.js`、`git diff --check`。
 - 风险/注意事项：默认 UI 若启用，IP 位置信息请求不再携带 token；在 `/ip-info` 默认关闭或未授权时，前端会按失败逻辑显示位置信息获取失败。
 - 是否创建 PR：否，本次为 PR #1 追加小修复 commit。
+
+### 2026-06-25 08:08
+- 分支：codex/refactor-doh-project-configuration-and-security-2026-06-25-07-58-02
+- 修改文件：`README.md`、`codex.md`
+- 修改内容摘要：仅修正文档中的 Cloudflare Worker 部署名称，将部署命令中的 `--name dns-doh` 改为真实 Worker 名称 `--name dns`，并确认文档中无其他 `dns-doh` 残留。
+- 测试情况：已运行 `git diff --check`。
+- 风险/注意事项：本次仅修改文档和维护记录，不涉及 Worker 运行时代码。
+- 是否创建 PR：否，本次为 PR #1 追加小修复 commit。
