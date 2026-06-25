@@ -44,7 +44,7 @@ function parseConfig(env = {}) {
   return {
     dohPath,
     upstreamHost,
-    dnsJsonEndpoint: `https://${upstreamHost}/resolve`,
+    dnsJsonEndpoint: buildDnsJsonEndpoint(upstreamHost),
     dnsMessageEndpoint: `https://${upstreamHost}/dns-query`,
     enableIpInfo: String(env.ENABLE_IP_INFO || '').toLowerCase() === 'true',
     authToken: env.AUTH_TOKEN || '',
@@ -53,6 +53,11 @@ function parseConfig(env = {}) {
     url: env.URL || '',
     url302: env.URL302 || '',
   };
+}
+
+function buildDnsJsonEndpoint(host) {
+  if (host === 'dns.google') return `https://${host}/resolve`;
+  return `https://${host}/dns-query`;
 }
 
 function parseAllowedUpstreams(value) {
@@ -108,7 +113,7 @@ function resolveDohEndpoint(value, config, json = true) {
   if (!value || value === 'current') return json ? config.dnsJsonEndpoint : config.dnsMessageEndpoint;
   const host = normalizeUpstreamHost(value);
   if (!config.allowedUpstreams.has(host)) return null;
-  return json ? `https://${host}/resolve` : `https://${host}/dns-query`;
+  return json ? buildDnsJsonEndpoint(host) : `https://${host}/dns-query`;
 }
 
 async function handleIpInfo(request, config) {

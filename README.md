@@ -76,10 +76,17 @@ DOH=dns.google
 DOH=https://cloudflare-dns.com/dns-query
 ```
 
-Worker 会提取 host，并生成：
+Worker 会提取 host，并按上游生成 JSON 与 DNS Message endpoint：
 
-- DNS Message Endpoint：`https://<host>/dns-query`
-- DNS JSON Endpoint：`https://<host>/resolve`
+- `cloudflare-dns.com`：
+  - JSON：`https://cloudflare-dns.com/dns-query`
+  - DNS Message：`https://cloudflare-dns.com/dns-query`
+- `dns.google`：
+  - JSON：`https://dns.google/resolve`
+  - DNS Message：`https://dns.google/dns-query`
+- 其他允许的上游：
+  - JSON：`https://<host>/dns-query`
+  - DNS Message：`https://<host>/dns-query`
 
 `DOH` 必须位于 `ALLOWED_UPSTREAMS` 白名单内。测试白名单建议：
 
