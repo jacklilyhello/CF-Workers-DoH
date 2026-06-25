@@ -25,3 +25,11 @@
 - 测试情况：已运行 `node --check _worker.js`、`node --check scripts/test_doh.js`。
 - 风险/注意事项：`ALLOWED_UPSTREAMS` 仅允许列出的上游，前端旧自定义 DoH 上游若不在白名单会被拒绝；启用 `/ip-info` 必须设置 `ENABLE_IP_INFO=true` 和 `AUTH_TOKEN`。
 - 是否创建 PR：是。
+
+### 2026-06-25 08:02
+- 分支：codex/refactor-doh-project-configuration-and-security-2026-06-25-07-58-02
+- 修改文件：`_worker.js`、`codex.md`
+- 修改内容摘要：修复 HTML 模板中残留的旧 `DoH路径` / `DoH` 变量，改为通过 `HTML(config)` 使用 `config.dohPath` 和 `config.upstreamHost`；移除前端 `/ip-info` 请求中基于 DoH 路径拼接的 token，避免向页面注入或泄露鉴权信息。
+- 测试情况：已运行 `node --check _worker.js`、`node --check scripts/test_doh.js`、`git diff --check`。
+- 风险/注意事项：默认 UI 若启用，IP 位置信息请求不再携带 token；在 `/ip-info` 默认关闭或未授权时，前端会按失败逻辑显示位置信息获取失败。
+- 是否创建 PR：否，本次为 PR #1 追加小修复 commit。

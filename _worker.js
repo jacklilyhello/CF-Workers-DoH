@@ -25,7 +25,7 @@ export default {
     }
 
     if (config.disableWebUi) return jsonResponse({ error: 'Not found' }, 404);
-    return await HTML();
+    return await HTML(config);
   }
 }
 
@@ -237,8 +237,10 @@ async function DOHRequest(request, config) {
   }
 }
 
-async function HTML() {
+async function HTML(config) {
   // 否则返回 HTML 页面
+  const displayDohPath = config.dohPath.replace(/^\//, '');
+  const upstreamHost = config.upstreamHost;
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 
@@ -752,7 +754,7 @@ async function HTML() {
 
     <div class="beian-info">
       <p><strong>DNS-over-HTTPS：<span id="dohUrlDisplay" class="copy-link" title="点击复制">https://<span
-              id="currentDomain">...</span>/${DoH路径}</span></strong><br>基于 Cloudflare Workers 上游 ${DoH} 的 DoH (DNS over HTTPS)
+              id="currentDomain">...</span>/${displayDohPath}</span></strong><br>基于 Cloudflare Workers 上游 ${upstreamHost} 的 DoH (DNS over HTTPS)
         解析服务</p>
     </div>
   </div>
@@ -763,7 +765,7 @@ async function HTML() {
     const currentUrl = window.location.href;
     const currentHost = window.location.host;
     const currentProtocol = window.location.protocol;
-    const currentDohPath = '${DoH路径}';
+    const currentDohPath = '${displayDohPath}';
     const currentDohUrl = currentProtocol + '//' + currentHost + '/' + currentDohPath;
 
     // 记录当前使用的 DoH 地址
@@ -847,7 +849,7 @@ async function HTML() {
     async function queryIpGeoInfo(ip) {
       try {
         // 改为使用我们自己的代理接口
-        const response = await fetch(\`./ip-info?ip=\${ip}&token=${DoH路径}\`);
+        const response = await fetch(\`./ip-info?ip=\${ip}\`);
             if (!response.ok) {
               throw new Error(\`HTTP 错误: \${response.status}\`);
             }
