@@ -41,3 +41,12 @@
 - 测试情况：已运行 `git diff --check`。
 - 风险/注意事项：本次仅修改文档和维护记录，不涉及 Worker 运行时代码。
 - 是否创建 PR：否，本次为 PR #1 追加小修复 commit。
+
+
+### 2026-06-25 08:20
+- 分支：fix/provider-aware-json-endpoint
+- 修改文件：`_worker.js`、`README.md`、`codex.md`
+- 修改内容摘要：新增 provider-aware JSON endpoint 生成逻辑，确保 `dns.google` 使用 `/resolve`，Cloudflare 及其他允许上游使用 `/dns-query`；同步 README 中上游 endpoint 说明。
+- 测试情况：已运行 `node --check _worker.js`、`node --check scripts/test_doh.js`、`git diff --check`；线上 curl 因当前环境 CONNECT tunnel 403 未能直连验证。
+- 风险/注意事项：仅调整 JSON DoH endpoint 生成逻辑，DNS Message endpoint、`/ip-info`、`PATH`、`AUTH_TOKEN`、`DISABLE_WEB_UI`、`URL=nginx` 逻辑保持不变。
+- 是否创建 PR：是。
