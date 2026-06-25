@@ -1,111 +1,159 @@
 # 📶 CF-Workers-DoH
 ![img](./img.png)
 
-CF-Workers-DoH 是一个基于 Cloudflare Workers 构建的 DNS over HTTPS (DoH) 解析服务。它允许你通过 HTTPS 协议进行 DNS 查询，提高查询的安全性和隐私保护。
+CF-Workers-DoH 是一个基于 Cloudflare Workers 构建的 DNS over HTTPS (DoH) 解析服务，适合个人安全、隐藏部署。项目维护记录见 [codex.md](./codex.md)。
 
 > [!CAUTION]
-> **doh.cmliussss.hidns.co 已被GFW阻断，需自行部署使用。**
-
-> [!WARNING]
-> 如需搭建非公益服务，请务必添加`TOKEN`与`URL`变量，`URL`变量推荐为 **nginx** 即可！
+> 请自行部署使用，不建议把个人 Worker 暴露为开放代理或公开 DNS 服务。
 
 ## 🚀 部署方式
 
-- **Workers** 部署：复制 [_worker.js](https://github.com/cmliu/CF-Workers-DoH/blob/main/_worker.js) 代码，`保存并部署`即可
-- **Pages** 部署：`Fork` 后 `连接GitHub` 一键部署即可
+- **Workers** 部署：复制 [_worker.js](./_worker.js) 代码，保存并部署。
+- **Git 连接部署**：Cloudflare Worker 已连接仓库时，可使用：
 
-## 📖 使用方法
+```bash
+npx wrangler deploy _worker.js --name dns --keep-vars --compatibility-date 2026-06-25
+```
 
-假设你已部署成功，你的服务域名为：`doh.cmliussss.hidns.co`
+## 🔐 推荐个人部署变量
 
-### 1️⃣ DNS解析服务 (DoH)
+```env
+PATH=dns-query
+DOH=cloudflare-dns.com
+URL=nginx
+ENABLE_IP_INFO=false
+AUTH_TOKEN=强随机字符串
+DISABLE_WEB_UI=true
+ALLOWED_UPSTREAMS=cloudflare-dns.com,dns.google
+```
 
-将以下地址添加到支持DoH的设备或软件中：
+- `PATH` 只控制 DoH 路径，支持 `dns-query` 或 `/dns-query`，最终入口为 `/dns-query`。
+- `AUTH_TOKEN` 只用于 `/ip-info` 或未来管理接口鉴权。
+- `TOKEN` 已废弃（deprecated）：仅为兼容旧配置保留。当没有设置 `PATH` 但设置了 `TOKEN` 时，`TOKEN` 会临时作为 DoH 路径；不推荐继续使用。
+- `/ip-info` 默认关闭，必须显式设置 `ENABLE_IP_INFO=true` 才会启用。
+- `DISABLE_WEB_UI=true` 时不会显示默认 DNS 查询 HTML 页面；若 `URL=nginx`，首页 `/` 会返回 nginx 伪装页。
+- `ALLOWED_UPSTREAMS` 用于限制可用 DoH 上游，避免 `doh=` 参数变成开放代理。
+
+## 📖 DoH 使用与测试
+
+假设实际部署域名为：`https://dns.888888.mom/dns-query`
+
+### 标准 DoH 地址
 
 ```url
-https://doh.cmliussss.hidns.co/dns-query
+https://dns.888888.mom/dns-query
 ```
 
-- 还可使用 Cloudflare 回源端口 `2053`、`2083`、`2087`、`2096`、`8443`，例如
-```url
-https://doh.cmliussss.hidns.co:2053/dns-query
+### JSON 查询
+
+```bash
+curl "https://dns.888888.mom/dns-query?name=google.com&type=A" -H "Accept: application/dns-json"
+curl "https://dns.888888.mom/dns-query?name=google.com&type=AAAA" -H "Accept: application/dns-json"
 ```
 
-- 如您设置了`TOKEN`变量为 **CMLiussss**，则
-```url
-https://doh.cmliussss.hidns.co/CMLiussss
-```
-### 2️⃣ 附加功能 IP信息查询
+### RFC8484 dns 参数 / POST
 
-#### 🔍 查询当前IP信息
-```url
-https://doh.cmliussss.hidns.co/ip-info
-```
+`scripts/test_doh.js` 会测试：
 
-- 如您设置了`TOKEN`变量为 **CMLiussss**，则
-```url
-https://doh.cmliussss.hidns.co/ip-info?token=CMLiussss
-```
+1. GET `?dns=base64url_dns_message`
+2. POST `application/dns-message`
+3. GET JSON API
 
-#### 🔍 查询指定IP信息
-```url
-https://doh.cmliussss.hidns.co/ip-info?ip=8.8.8.8
+推荐通过环境变量指定端点：
+
+```bash
+DOH_ENDPOINT=https://dns.888888.mom/dns-query node scripts/test_doh.js
+TEST_DOMAIN=google.com DOH_ENDPOINT=https://dns.888888.mom/dns-query node scripts/test_doh.js
 ```
 
-- 如您设置了`TOKEN`变量为 **CMLiussss**，则
+## 🌐 上游 DoH
 
-```url
-https://doh.cmliussss.hidns.co/ip-info?ip=8.8.8.8&token=CMLiussss
+`DOH` 支持填写主机名或完整 URL，例如：
+
+```env
+DOH=cloudflare-dns.com
+DOH=dns.google
+DOH=https://cloudflare-dns.com/dns-query
 ```
 
-#### 📝 **返回信息示例**
-```json
-{
-  "status": "success",
-  "country": "美国",
-  "countryCode": "US",
-  "region": "VA",
-  "regionName": "弗吉尼亚州",
-  "city": "Ashburn",
-  "zip": "20149",
-  "lat": 39.03,
-  "lon": -77.5,
-  "timezone": "America/New_York",
-  "isp": "Google LLC",
-  "org": "Google Public DNS",
-  "as": "AS15169 Google LLC",
-  "query": "8.8.8.8"
-}
+Worker 会提取 host，并生成：
+
+- DNS Message Endpoint：`https://<host>/dns-query`
+- DNS JSON Endpoint：`https://<host>/resolve`
+
+`DOH` 必须位于 `ALLOWED_UPSTREAMS` 白名单内。测试白名单建议：
+
+```env
+ALLOWED_UPSTREAMS=cloudflare-dns.com,dns.google
 ```
 
-> [!NOTE]
-> 请将示例中的 `doh.cmliussss.hidns.co` 替换为你实际部署的域名
+## 🧭 /ip-info 安全说明
+
+`/ip-info` 默认关闭：
+
+```env
+ENABLE_IP_INFO=false
+```
+
+启用时必须同时设置强随机 `AUTH_TOKEN`：
+
+```env
+ENABLE_IP_INFO=true
+AUTH_TOKEN=强随机字符串
+```
+
+支持 URL token：
+
+```bash
+curl -i "https://dns.888888.mom/ip-info?ip=8.8.8.8&token=强随机字符串"
+```
+
+也支持 Bearer Token：
+
+```bash
+curl -i "https://dns.888888.mom/ip-info?ip=8.8.8.8" -H "Authorization: Bearer 强随机字符串"
+```
+
+未启用时访问 `/ip-info` 返回 `404`；启用但鉴权失败返回 `403`。
 
 ## 🔧 变量说明
 
-| 变量名 | 示例 | 必填 | 备注 | 
+| 变量名 | 示例 | 必填 | 备注 |
 |--|--|--|--|
-| DOH | `dns.google` |❌| 设置上游DoH服务（默认：`cloudflare-dns.com`） |
-| TOKEN | `dns-query` |❌| 设置请求DoH服务路径（默认：`/dns-query`） |
-| URL | `https://www.baidu.com/` |❌| 主页伪装（设为`nginx`则伪装为nginx默认页面） |
-| URL302 | `https://t.me/CMLiussss` |❌| 主页302跳转（与`URL`变量同时存在时优先执行`URL302`）|
+| `PATH` | `dns-query` | ❌ | DoH 服务路径，默认 `/dns-query` |
+| `DOH` | `cloudflare-dns.com` | ❌ | 上游 DoH，默认 `cloudflare-dns.com` |
+| `ALLOWED_UPSTREAMS` | `cloudflare-dns.com,dns.google` | ❌ | 允许的上游白名单 |
+| `ENABLE_IP_INFO` | `false` | ❌ | 是否启用 `/ip-info`，默认关闭 |
+| `AUTH_TOKEN` | `强随机字符串` | 启用 `/ip-info` 时建议 | `/ip-info` 鉴权 token |
+| `DISABLE_WEB_UI` | `true` | ❌ | 是否关闭默认 HTML 查询页面 |
+| `URL` | `nginx` | ❌ | 首页伪装；`nginx` 返回 nginx 默认页，URL 则反代 |
+| `URL302` | `https://example.com/` | ❌ | 首页 302 跳转，优先于 `URL` |
+| `TOKEN` | `dns-query` | ❌ | 已废弃，仅兼容旧 DoH 路径逻辑，不推荐使用 |
 
-> [!TIP]
-> 1. 使用 `dns.google` 或 `cloudflare-dns.com` 作为DoH上游时，**解析速度最佳**！
-> 2. 使用 `security.cloudflare-dns.com` 作为DoH上游时，可**阻止恶意软件**的DNS解析服务；
-> 3. 使用 `family.cloudflare-dns.com` 作为DoH上游时，可**阻止恶意软件**和**成人内容**的DNS解析服务；
-> 4. 已知 `doh.pub` **自带污染**，不适合作为DoH上游；
-> 5. 目前 `sm2.doh.pub`、`dns.alidns.com` 和 `doh.360.cn` 在**非中国大陆环境**请求DoH时，会下发干净DNS解析服务，也就是**可以作为CF-DoH的上游**，但是**解析速度不佳**。
+## 🧪 常用测试命令
 
-## ⭐ Star 星星走起
-[![Stargazers over time](https://starchart.cc/cmliu/CF-Workers-DoH.svg?variant=adaptive)](https://starchart.cc/cmliu/CF-Workers-DoH)
+```bash
+curl -I https://dns.888888.mom/dns-query
+curl "https://dns.888888.mom/dns-query?name=google.com&type=A" -H "Accept: application/dns-json"
+curl "https://dns.888888.mom/dns-query?name=google.com&type=AAAA" -H "Accept: application/dns-json"
+curl -i "https://dns.888888.mom/ip-info"
+curl -i "https://dns.888888.mom/ip-info?ip=8.8.8.8&token=test888"
+curl -I https://dns.888888.mom/
+DOH_ENDPOINT=https://dns.888888.mom/dns-query node scripts/test_doh.js
+```
 
 ## 💡 技术特性
+
 - 基于 Cloudflare Workers 无服务器架构
-- 使用原生 JavaScript 实现
+- 单文件 `_worker.js` 部署
+- 不引入复杂依赖
+- 支持标准 DoH GET / POST
+- 安全优先：限制上游、默认关闭 `/ip-info`、公开错误不暴露 stack
 
 ## 📝 许可证
-本项目开源使用，欢迎自由部署和修改！
+
+本项目开源使用，欢迎自由部署和修改。
 
 ## 🙏 鸣谢
+
 [tina-hello](https://github.com/tina-hello/doh-cf-workers)、[ip-api](https://ip-api.com/)、Cloudflare、GPT

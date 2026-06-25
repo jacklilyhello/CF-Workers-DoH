@@ -1,508 +1,246 @@
-let DoH = "cloudflare-dns.com";
-const jsonDoH = `https://${DoH}/resolve`;
-const dnsDoH = `https://${DoH}/dns-query`;
-let DoH路径 = 'dns-query';
+const DEFAULT_UPSTREAM = 'cloudflare-dns.com';
+const DEFAULT_DOH_PATH = 'dns-query';
+const DEFAULT_ALLOWED_UPSTREAMS = 'cloudflare-dns.com,dns.google';
+
 export default {
   async fetch(request, env) {
-    if (env.DOH) {
-      DoH = env.DOH;
-      const match = DoH.match(/:\/\/([^\/]+)/);
-      if (match) {
-        DoH = match[1];
-      }
-    }
-    DoH路径 = env.PATH || env.TOKEN || DoH路径;//DoH路径也单独设置 变量PATH
-    if (DoH路径.includes("/")) DoH路径 = DoH路径.split("/")[1];
+    const config = parseConfig(env);
     const url = new URL(request.url);
     const path = url.pathname;
-    const hostname = url.hostname;
 
-    // 处理 OPTIONS 预检请求
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400'
-        }
-      });
+    if (request.method === 'OPTIONS') return corsPreflightResponse();
+
+    if (path === config.dohPath) return DOHRequest(request, config);
+
+    if (path === '/ip-info') return handleIpInfo(request, config);
+
+    if (url.searchParams.has('doh')) return handleFrontendDnsQuery(request, config);
+
+    if (config.url302) return Response.redirect(config.url302, 302);
+    if (config.url) {
+      if (config.url.toLowerCase() === 'nginx') {
+        return new Response(await nginx(), { headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+      }
+      return await 代理URL(config.url, url);
     }
 
-    // 如果请求路径，则作为 DoH 服务器处理
-    if (path === `/${DoH路径}`) {
-      return await DOHRequest(request);
-    }
-
-    // 添加IP地理位置信息查询代理
-    if (path === '/ip-info') {
-      if (env.TOKEN) {
-        const token = url.searchParams.get('token');
-        if (token != env.TOKEN) {
-          return new Response(JSON.stringify({ 
-            status: "error",
-            message: "Token不正确",
-            code: "AUTH_FAILED",
-            timestamp: new Date().toISOString()
-          }, null, 4), {
-            status: 403,
-            headers: {
-              "content-type": "application/json; charset=UTF-8",
-              'Access-Control-Allow-Origin': '*'
-            }
-          });
-        }
-      }
-
-      const ip = url.searchParams.get('ip') || request.headers.get('CF-Connecting-IP');
-      if (!ip) {
-        return new Response(JSON.stringify({ 
-          status: "error",
-          message: "IP参数未提供",
-          code: "MISSING_PARAMETER",
-          timestamp: new Date().toISOString()
-        }, null, 4), {
-          status: 400,
-          headers: {
-            "content-type": "application/json; charset=UTF-8",
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-      }
-
-      try {
-        // 使用Worker代理请求HTTP的IP API
-        const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
-
-        if (!response.ok) {
-          throw new Error(`HTTP error: ${response.status}`);
-        }
-
-        const data = await response.json();
-        
-        // 添加时间戳到成功的响应数据中
-        data.timestamp = new Date().toISOString();
-
-        // 返回数据给客户端，并添加CORS头
-        return new Response(JSON.stringify(data, null, 4), {
-          headers: {
-            "content-type": "application/json; charset=UTF-8",
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-
-      } catch (error) {
-        console.error("IP查询失败:", error);
-        return new Response(JSON.stringify({
-          status: "error",
-          message: `IP查询失败: ${error.message}`,
-          code: "API_REQUEST_FAILED",
-          query: ip,
-          timestamp: new Date().toISOString(),
-          details: {
-            errorType: error.name,
-            stack: error.stack ? error.stack.split('\n')[0] : null
-          }
-        }, null, 4), {
-          status: 500,
-          headers: {
-            "content-type": "application/json; charset=UTF-8",
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-      }
-    }
-
-    // 如果请求参数中包含 domain 和 doh，则执行 DNS 解析
-    if (url.searchParams.has("doh")) {
-      const domain = url.searchParams.get("domain") || url.searchParams.get("name") || "www.google.com";
-      const doh = url.searchParams.get("doh") || dnsDoH;
-      const type = url.searchParams.get("type") || "all"; // 默认同时查询 A 和 AAAA
-
-      // 如果使用的是当前站点，则使用 DoH 服务
-      if (doh.includes(url.host)) {
-        return await handleLocalDohRequest(domain, type, hostname);
-      }
-
-      try {
-        // 根据请求类型进行不同的处理
-        if (type === "all") {
-          // 同时请求 A、AAAA 和 NS 记录，使用新的查询函数
-          const ipv4Result = await queryDns(doh, domain, "A");
-          const ipv6Result = await queryDns(doh, domain, "AAAA");
-          const nsResult = await queryDns(doh, domain, "NS");
-
-          // 合并结果 - 修改Question字段处理方式以兼容不同格式
-          const combinedResult = {
-            Status: ipv4Result.Status || ipv6Result.Status || nsResult.Status,
-            TC: ipv4Result.TC || ipv6Result.TC || nsResult.TC,
-            RD: ipv4Result.RD || ipv6Result.RD || nsResult.RD,
-            RA: ipv4Result.RA || ipv6Result.RA || nsResult.RA,
-            AD: ipv4Result.AD || ipv6Result.AD || nsResult.AD,
-            CD: ipv4Result.CD || ipv6Result.CD || nsResult.CD,
-
-            // 修改处理Question字段的方式，兼容对象格式和数组格式
-            Question: [],
-
-            Answer: [...(ipv4Result.Answer || []), ...(ipv6Result.Answer || [])],
-            ipv4: {
-              records: ipv4Result.Answer || []
-            },
-            ipv6: {
-              records: ipv6Result.Answer || []
-            },
-            ns: {
-              records: []
-            }
-          };
-
-          // 正确处理Question字段，无论是对象还是数组
-          if (ipv4Result.Question) {
-            if (Array.isArray(ipv4Result.Question)) {
-              combinedResult.Question.push(...ipv4Result.Question);
-            } else {
-              combinedResult.Question.push(ipv4Result.Question);
-            }
-          }
-
-          if (ipv6Result.Question) {
-            if (Array.isArray(ipv6Result.Question)) {
-              combinedResult.Question.push(...ipv6Result.Question);
-            } else {
-              combinedResult.Question.push(ipv6Result.Question);
-            }
-          }
-
-          if (nsResult.Question) {
-            if (Array.isArray(nsResult.Question)) {
-              combinedResult.Question.push(...nsResult.Question);
-            } else {
-              combinedResult.Question.push(nsResult.Question);
-            }
-          }
-
-          // 处理NS记录 - 可能在Answer或Authority部分
-          const nsRecords = [];
-
-          // 从Answer部分收集NS记录
-          if (nsResult.Answer && nsResult.Answer.length > 0) {
-            nsResult.Answer.forEach(record => {
-              if (record.type === 2) { // NS记录类型是2
-                nsRecords.push(record);
-              }
-            });
-          }
-
-          // 从Authority部分收集NS和SOA记录
-          if (nsResult.Authority && nsResult.Authority.length > 0) {
-            nsResult.Authority.forEach(record => {
-              if (record.type === 2 || record.type === 6) { // NS=2, SOA=6
-                nsRecords.push(record);
-                // 也添加到总Answer数组
-                combinedResult.Answer.push(record);
-              }
-            });
-          }
-
-          // 设置NS记录集合
-          combinedResult.ns.records = nsRecords;
-
-          return new Response(JSON.stringify(combinedResult, null, 2), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
-          });
-        } else {
-          // 普通的单类型查询，使用新的查询函数
-          const result = await queryDns(doh, domain, type);
-          return new Response(JSON.stringify(result, null, 2), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
-          });
-        }
-      } catch (err) {
-        console.error("DNS 查询失败:", err);
-        return new Response(JSON.stringify({
-          error: `DNS 查询失败: ${err.message}`,
-          doh: doh,
-          domain: domain,
-          stack: err.stack
-        }, null, 2), {
-          headers: { "content-type": "application/json; charset=UTF-8" },
-          status: 500
-        });
-      }
-    }
-
-    if (env.URL302) return Response.redirect(env.URL302, 302);
-    else if (env.URL) {
-      if (env.URL.toString().toLowerCase() == 'nginx') {
-        return new Response(await nginx(), {
-          headers: {
-            'Content-Type': 'text/html; charset=UTF-8',
-          },
-        });
-      } else return await 代理URL(env.URL, url);
-    } else return await HTML();
+    if (config.disableWebUi) return jsonResponse({ error: 'Not found' }, 404);
+    return await HTML(config);
   }
 }
 
-// 查询DNS的通用函数
-async function queryDns(dohServer, domain, type) {
-  // 构造 DoH 请求 URL
-  const dohUrl = new URL(dohServer);
-  dohUrl.searchParams.set("name", domain);
-  dohUrl.searchParams.set("type", type);
-
-  // 尝试多种请求头格式
-  const fetchOptions = [
-    // 标准 application/dns-json
-    {
-      headers: { 'Accept': 'application/dns-json' }
-    },
-    // 部分服务使用没有指定 Accept 头的请求
-    {
-      headers: {}
-    },
-    // 另一个尝试 application/json
-    {
-      headers: { 'Accept': 'application/json' }
-    },
-    // 稳妥起见，有些服务可能需要明确的用户代理
-    {
-      headers: {
-        'Accept': 'application/dns-json',
-        'User-Agent': 'Mozilla/5.0 DNS Client'
-      }
-    }
-  ];
-
-  let lastError = null;
-
-  // 依次尝试不同的请求头组合
-  for (const options of fetchOptions) {
-    try {
-      const response = await fetch(dohUrl.toString(), options);
-
-      // 如果请求成功，解析JSON
-      if (response.ok) {
-        const contentType = response.headers.get('content-type') || '';
-        // 检查内容类型是否兼容
-        if (contentType.includes('json') || contentType.includes('dns-json')) {
-          return await response.json();
-        } else {
-          // 对于非标准的响应，仍尝试进行解析
-          const textResponse = await response.text();
-          try {
-            return JSON.parse(textResponse);
-          } catch (jsonError) {
-            throw new Error(`无法解析响应为JSON: ${jsonError.message}, 响应内容: ${textResponse.substring(0, 100)}`);
-          }
-        }
-      }
-
-      // 错误情况记录，继续尝试下一个选项
-      const errorText = await response.text();
-      lastError = new Error(`DoH 服务器返回错误 (${response.status}): ${errorText.substring(0, 200)}`);
-
-    } catch (err) {
-      // 记录错误，继续尝试下一个选项
-      lastError = err;
-    }
+function parseConfig(env = {}) {
+  const allowedUpstreams = parseAllowedUpstreams(env.ALLOWED_UPSTREAMS);
+  const configuredHost = normalizeUpstreamHost(env.DOH || DEFAULT_UPSTREAM);
+  let upstreamHost = configuredHost;
+  if (!allowedUpstreams.has(upstreamHost)) {
+    console.warn(`DOH upstream "${configuredHost}" is not allowed; falling back to ${DEFAULT_UPSTREAM}`);
+    upstreamHost = allowedUpstreams.has(DEFAULT_UPSTREAM) ? DEFAULT_UPSTREAM : [...allowedUpstreams][0];
   }
 
-  // 所有尝试都失败，抛出最后一个错误
-  throw lastError || new Error("无法完成 DNS 查询");
+  const pathSource = env.PATH || (!env.PATH && env.TOKEN ? env.TOKEN : DEFAULT_DOH_PATH);
+  const dohPath = normalizeDohPath(pathSource);
+
+  return {
+    dohPath,
+    upstreamHost,
+    dnsJsonEndpoint: `https://${upstreamHost}/resolve`,
+    dnsMessageEndpoint: `https://${upstreamHost}/dns-query`,
+    enableIpInfo: String(env.ENABLE_IP_INFO || '').toLowerCase() === 'true',
+    authToken: env.AUTH_TOKEN || '',
+    disableWebUi: String(env.DISABLE_WEB_UI || '').toLowerCase() === 'true',
+    allowedUpstreams,
+    url: env.URL || '',
+    url302: env.URL302 || '',
+  };
 }
 
-// 处理本地 DoH 请求的函数 - 直接调用 DoH，而不是自身服务
-async function handleLocalDohRequest(domain, type, hostname) {
+function parseAllowedUpstreams(value) {
+  const hosts = String(value || DEFAULT_ALLOWED_UPSTREAMS)
+    .split(',')
+    .map((item) => normalizeUpstreamHost(item.trim()))
+    .filter(Boolean);
+  return new Set(hosts.length ? hosts : [DEFAULT_UPSTREAM]);
+}
+
+function normalizeUpstreamHost(value) {
+  if (!value) return DEFAULT_UPSTREAM;
   try {
-    if (type === "all") {
-      // 同时请求 A、AAAA 和 NS 记录
-      const ipv4Promise = queryDns(dnsDoH, domain, "A");
-      const ipv6Promise = queryDns(dnsDoH, domain, "AAAA");
-      const nsPromise = queryDns(dnsDoH, domain, "NS");
+    const withProtocol = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+    return new URL(withProtocol).hostname.toLowerCase();
+  } catch (_) {
+    return String(value).replace(/^https?:\/\//i, '').split('/')[0].toLowerCase();
+  }
+}
 
-      // 等待所有请求完成
-      const [ipv4Result, ipv6Result, nsResult] = await Promise.all([ipv4Promise, ipv6Promise, nsPromise]);
+function normalizeDohPath(value) {
+  const clean = String(value || DEFAULT_DOH_PATH).trim().replace(/^\/+|\/+$/g, '') || DEFAULT_DOH_PATH;
+  return `/${clean.split('/')[0] || DEFAULT_DOH_PATH}`;
+}
 
-      // 准备NS记录数组
-      const nsRecords = [];
+function corsHeaders(extra = {}) {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+    ...extra,
+  };
+}
 
-      // 从Answer和Authority部分收集NS记录
-      if (nsResult.Answer && nsResult.Answer.length > 0) {
-        nsRecords.push(...nsResult.Answer.filter(record => record.type === 2));
-      }
+function corsPreflightResponse() {
+  return new Response(null, { headers: corsHeaders({ 'Access-Control-Max-Age': '86400' }) });
+}
 
-      if (nsResult.Authority && nsResult.Authority.length > 0) {
-        nsRecords.push(...nsResult.Authority.filter(record => record.type === 2 || record.type === 6));
-      }
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: corsHeaders({ 'Content-Type': 'application/json; charset=UTF-8', ...headers }),
+  });
+}
 
-      // 合并结果
-      const combinedResult = {
+function getBearerToken(request) {
+  const authorization = request.headers.get('Authorization') || '';
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : '';
+}
+
+function resolveDohEndpoint(value, config, json = true) {
+  if (!value || value === 'current') return json ? config.dnsJsonEndpoint : config.dnsMessageEndpoint;
+  const host = normalizeUpstreamHost(value);
+  if (!config.allowedUpstreams.has(host)) return null;
+  return json ? `https://${host}/resolve` : `https://${host}/dns-query`;
+}
+
+async function handleIpInfo(request, config) {
+  if (!config.enableIpInfo) return jsonResponse({ error: 'Not found' }, 404);
+
+  const url = new URL(request.url);
+  const token = url.searchParams.get('token') || getBearerToken(request);
+  if (!config.authToken || token !== config.authToken) return jsonResponse({ error: 'Forbidden' }, 403);
+
+  const ip = url.searchParams.get('ip') || request.headers.get('CF-Connecting-IP');
+  if (!ip) return jsonResponse({ error: 'Missing ip parameter' }, 400);
+
+  try {
+    const response = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?lang=zh-CN`);
+    if (!response.ok) throw new Error(`ip-api status ${response.status}`);
+    const data = await response.json();
+    data.timestamp = new Date().toISOString();
+    return jsonResponse(data);
+  } catch (error) {
+    console.error('IP info request failed:', error);
+    return jsonResponse({ error: 'IP info request failed' }, 500);
+  }
+}
+
+async function handleFrontendDnsQuery(request, config) {
+  const url = new URL(request.url);
+  const domain = url.searchParams.get('domain') || url.searchParams.get('name') || 'www.google.com';
+  const type = url.searchParams.get('type') || 'all';
+  const endpoint = resolveDohEndpoint(url.searchParams.get('doh'), config, true);
+  if (!endpoint) return jsonResponse({ error: 'Upstream is not allowed' }, 403);
+
+  try {
+    if (type === 'all') {
+      const [ipv4Result, ipv6Result, nsResult] = await Promise.all([
+        queryDns(endpoint, domain, 'A'),
+        queryDns(endpoint, domain, 'AAAA'),
+        queryDns(endpoint, domain, 'NS'),
+      ]);
+      const nsRecords = [
+        ...(nsResult.Answer || []).filter((record) => record.type === 2),
+        ...(nsResult.Authority || []).filter((record) => record.type === 2 || record.type === 6),
+      ];
+      return jsonResponse({
         Status: ipv4Result.Status || ipv6Result.Status || nsResult.Status,
         TC: ipv4Result.TC || ipv6Result.TC || nsResult.TC,
         RD: ipv4Result.RD || ipv6Result.RD || nsResult.RD,
         RA: ipv4Result.RA || ipv6Result.RA || nsResult.RA,
         AD: ipv4Result.AD || ipv6Result.AD || nsResult.AD,
         CD: ipv4Result.CD || ipv6Result.CD || nsResult.CD,
-        Question: [...(ipv4Result.Question || []), ...(ipv6Result.Question || []), ...(nsResult.Question || [])],
-        Answer: [
-          ...(ipv4Result.Answer || []),
-          ...(ipv6Result.Answer || []),
-          ...nsRecords
-        ],
-        ipv4: {
-          records: ipv4Result.Answer || []
-        },
-        ipv6: {
-          records: ipv6Result.Answer || []
-        },
-        ns: {
-          records: nsRecords
-        }
-      };
-
-      return new Response(JSON.stringify(combinedResult, null, 2), {
-        headers: {
-          "content-type": "application/json; charset=UTF-8",
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    } else {
-      // 普通的单类型查询
-      const result = await queryDns(dnsDoH, domain, type);
-      return new Response(JSON.stringify(result, null, 2), {
-        headers: {
-          "content-type": "application/json; charset=UTF-8",
-          'Access-Control-Allow-Origin': '*'
-        }
+        Question: [ipv4Result.Question, ipv6Result.Question, nsResult.Question].flat().filter(Boolean),
+        Answer: [...(ipv4Result.Answer || []), ...(ipv6Result.Answer || []), ...nsRecords],
+        ipv4: { records: ipv4Result.Answer || [] },
+        ipv6: { records: ipv6Result.Answer || [] },
+        ns: { records: nsRecords },
       });
     }
-  } catch (err) {
-    console.error("DoH 查询失败:", err);
-    return new Response(JSON.stringify({
-      error: `DoH 查询失败: ${err.message}`,
-      stack: err.stack
-    }, null, 2), {
-      headers: {
-        "content-type": "application/json; charset=UTF-8",
-        'Access-Control-Allow-Origin': '*'
-      },
-      status: 500
-    });
+    return jsonResponse(await queryDns(endpoint, domain, type));
+  } catch (error) {
+    console.error('DNS query failed:', error);
+    return jsonResponse({ error: 'DNS query failed' }, 500);
   }
 }
 
-// DoH 请求处理函数
-async function DOHRequest(request) {
+async function queryDns(dohServer, domain, type) {
+  const dohUrl = new URL(dohServer);
+  dohUrl.searchParams.set('name', domain);
+  dohUrl.searchParams.set('type', type);
+
+  const fetchOptions = [
+    { headers: { Accept: 'application/dns-json' } },
+    { headers: {} },
+    { headers: { Accept: 'application/json' } },
+    { headers: { Accept: 'application/dns-json', 'User-Agent': 'Mozilla/5.0 DNS Client' } },
+  ];
+
+  let lastError = null;
+  for (const options of fetchOptions) {
+    try {
+      const response = await fetch(dohUrl.toString(), options);
+      if (response.ok) return await response.json();
+      lastError = new Error(`DoH status ${response.status}`);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error('DNS query failed');
+}
+
+async function DOHRequest(request, config) {
   const { method, headers, body } = request;
-  const UA = headers.get('User-Agent') || 'DoH Client';
+  const userAgent = headers.get('User-Agent') || 'DoH Client';
   const url = new URL(request.url);
   const { searchParams } = url;
 
   try {
-    // 直接访问端点的处理
     if (method === 'GET' && !url.search) {
-      // 如果是直接访问或浏览器访问，返回友好信息
-      return new Response('Bad Request', {
-        status: 400,
-        headers: {
-          'Content-Type': 'text/plain; charset=utf-8',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
+      return new Response('Bad Request', { status: 400, headers: corsHeaders({ 'Content-Type': 'text/plain; charset=utf-8' }) });
     }
 
-    // 根据请求方法和参数构建转发请求
     let response;
-
     if (method === 'GET' && searchParams.has('name')) {
-      const searchDoH = searchParams.has('type') ? url.search : url.search + '&type=A';
-      // 处理 JSON 格式的 DoH 请求
-      response = await fetch(dnsDoH + searchDoH, {
-        headers: {
-          'Accept': 'application/dns-json',
-          'User-Agent': UA
-        }
-      });
-      // 如果 DoHUrl 请求非成功（状态码 200），则再请求 jsonDoH
-      if (!response.ok) response = await fetch(jsonDoH + searchDoH, {
-        headers: {
-          'Accept': 'application/dns-json',
-          'User-Agent': UA
-        }
-      });
-    } else if (method === 'GET') {
-      // 处理 base64url 格式的 GET 请求
-      response = await fetch(dnsDoH + url.search, {
-        headers: {
-          'Accept': 'application/dns-message',
-          'User-Agent': UA
-        }
-      });
+      const upstreamUrl = new URL(config.dnsJsonEndpoint);
+      for (const [key, value] of searchParams) upstreamUrl.searchParams.set(key, value);
+      if (!upstreamUrl.searchParams.has('type')) upstreamUrl.searchParams.set('type', 'A');
+      response = await fetch(upstreamUrl.toString(), { headers: { Accept: 'application/dns-json', 'User-Agent': userAgent } });
+    } else if (method === 'GET' && searchParams.has('dns')) {
+      response = await fetch(config.dnsMessageEndpoint + url.search, { headers: { Accept: 'application/dns-message', 'User-Agent': userAgent } });
     } else if (method === 'POST') {
-      // 处理 POST 请求
-      response = await fetch(dnsDoH, {
+      response = await fetch(config.dnsMessageEndpoint, {
         method: 'POST',
-        headers: {
-          'Accept': 'application/dns-message',
-          'Content-Type': 'application/dns-message',
-          'User-Agent': UA
-        },
-        body: body
+        headers: { Accept: 'application/dns-message', 'Content-Type': 'application/dns-message', 'User-Agent': userAgent },
+        body,
       });
-
     } else {
-      // 其他不支持的请求方式
-      return new Response('不支持的请求格式: DoH请求需要包含name或dns参数，或使用POST方法', {
-        status: 400,
-        headers: {
-          'Content-Type': 'text/plain; charset=utf-8',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
+      return new Response('Bad Request', { status: 400, headers: corsHeaders({ 'Content-Type': 'text/plain; charset=utf-8' }) });
     }
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`DoH 返回错误 (${response.status}): ${errorText.substring(0, 200)}`);
-    }
-
-    // 创建一个新的响应头对象
+    if (!response.ok) throw new Error(`DoH status ${response.status}`);
     const responseHeaders = new Headers(response.headers);
-    // 设置跨域资源共享 (CORS) 的头部信息
-    responseHeaders.set('Access-Control-Allow-Origin', '*');
-    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    responseHeaders.set('Access-Control-Allow-Headers', '*');
-    
-    // 检查是否为JSON格式的DoH请求，确保设置正确的Content-Type
-    if (method === 'GET' && searchParams.has('name')) {
-      // 对于JSON格式的DoH请求，明确设置Content-Type为application/json
-      responseHeaders.set('Content-Type', 'application/json');
-    }
-
-    // 返回响应
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders
-    });
+    for (const [key, value] of Object.entries(corsHeaders())) responseHeaders.set(key, value);
+    if (method === 'GET' && searchParams.has('name')) responseHeaders.set('Content-Type', 'application/json');
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
   } catch (error) {
-    console.error("DoH 请求处理错误:", error);
-    return new Response(JSON.stringify({
-      error: `DoH 请求处理错误: ${error.message}`,
-      stack: error.stack
-    }, null, 4), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
+    console.error('DoH request failed:', error);
+    return jsonResponse({ error: 'DoH request failed' }, 500);
   }
 }
 
-async function HTML() {
+async function HTML(config) {
   // 否则返回 HTML 页面
+  const displayDohPath = config.dohPath.replace(/^\//, '');
+  const upstreamHost = config.upstreamHost;
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 
@@ -560,7 +298,7 @@ async function HTML() {
       background-clip: text;
       -webkit-text-fill-color: transparent;
       -moz-text-fill-color: transparent;
-      
+
       font-weight: 600;
       /* 注意：渐变文本和阴影效果同时使用可能不兼容，暂时移除阴影 */
       text-shadow: none;
@@ -1016,7 +754,7 @@ async function HTML() {
 
     <div class="beian-info">
       <p><strong>DNS-over-HTTPS：<span id="dohUrlDisplay" class="copy-link" title="点击复制">https://<span
-              id="currentDomain">...</span>/${DoH路径}</span></strong><br>基于 Cloudflare Workers 上游 ${DoH} 的 DoH (DNS over HTTPS)
+              id="currentDomain">...</span>/${displayDohPath}</span></strong><br>基于 Cloudflare Workers 上游 ${upstreamHost} 的 DoH (DNS over HTTPS)
         解析服务</p>
     </div>
   </div>
@@ -1027,7 +765,7 @@ async function HTML() {
     const currentUrl = window.location.href;
     const currentHost = window.location.host;
     const currentProtocol = window.location.protocol;
-    const currentDohPath = '${DoH路径}';
+    const currentDohPath = '${displayDohPath}';
     const currentDohUrl = currentProtocol + '//' + currentHost + '/' + currentDohPath;
 
     // 记录当前使用的 DoH 地址
@@ -1111,7 +849,7 @@ async function HTML() {
     async function queryIpGeoInfo(ip) {
       try {
         // 改为使用我们自己的代理接口
-        const response = await fetch(\`./ip-info?ip=\${ip}&token=${DoH路径}\`);
+        const response = await fetch(\`./ip-info?ip=\${ip}\`);
             if (!response.ok) {
               throw new Error(\`HTTP 错误: \${response.status}\`);
             }
@@ -1121,13 +859,13 @@ async function HTML() {
             return null;
           }
         }
-        
+
         // 处理点击复制功能
         function handleCopyClick(element, textToCopy) {
           navigator.clipboard.writeText(textToCopy).then(function() {
             // 添加复制成功的反馈
             element.classList.add('copied');
-            
+
             // 2秒后移除复制成功效果
             setTimeout(() => {
               element.classList.remove('copied');
@@ -1136,27 +874,27 @@ async function HTML() {
             console.error('复制失败:', err);
           });
         }
-        
+
         // 显示记录
         function displayRecords(data) {
           document.getElementById('resultContainer').style.display = 'block';
           document.getElementById('errorContainer').style.display = 'none';
           document.getElementById('result').textContent = JSON.stringify(data, null, 2);
-          
+
           // IPv4 记录
           const ipv4Records = data.ipv4?.records || [];
           const ipv4Container = document.getElementById('ipv4Records');
           ipv4Container.innerHTML = '';
-          
+
           if (ipv4Records.length === 0) {
             document.getElementById('ipv4Summary').innerHTML = \`<strong>未找到 IPv4 记录</strong>\`;
           } else {
             document.getElementById('ipv4Summary').innerHTML = \`<strong>找到 \${ipv4Records.length} 条 IPv4 记录</strong>\`;
-            
+
             ipv4Records.forEach(record => {
               const recordDiv = document.createElement('div');
               recordDiv.className = 'ip-record';
-              
+
               if (record.type === 5) { // CNAME 记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
@@ -1166,13 +904,13 @@ async function HTML() {
                   </div>
                 \`;
                 ipv4Container.appendChild(recordDiv);
-                
+
                 // 添加点击事件
                 const copyElem = recordDiv.querySelector('.ip-address');
                 copyElem.addEventListener('click', function() {
                   handleCopyClick(this, this.getAttribute('data-copy'));
                 });
-                
+
               } else if (record.type === 1) {  // A记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
@@ -1182,29 +920,29 @@ async function HTML() {
                   </div>
                 \`;
                 ipv4Container.appendChild(recordDiv);
-                
+
                 // 添加点击事件
                 const copyElem = recordDiv.querySelector('.ip-address');
                 copyElem.addEventListener('click', function() {
                   handleCopyClick(this, this.getAttribute('data-copy'));
                 });
-                
+
                 // 添加地理位置信息
                 const geoInfoSpan = recordDiv.querySelector('.geo-info');
-                
+
                 // 检查是否为阻断IP
                 if (isBlockedIP(record.data)) {
                   // 异步查询 IP 地理位置信息获取AS信息
                   queryIpGeoInfo(record.data).then(geoData => {
                     geoInfoSpan.innerHTML = '';
                     geoInfoSpan.classList.remove('geo-loading');
-                    
+
                     // 显示阻断IP标识（替代国家信息）
                     const blockedSpan = document.createElement('span');
                     blockedSpan.className = 'geo-blocked';
                     blockedSpan.textContent = '阻断IP';
                     geoInfoSpan.appendChild(blockedSpan);
-                    
+
                     // 如果有AS信息，正常显示
                     if (geoData && geoData.status === 'success' && geoData.as) {
                       const asSpan = document.createElement('span');
@@ -1216,7 +954,7 @@ async function HTML() {
                     // 查询失败时仍显示阻断IP标识
                     geoInfoSpan.innerHTML = '';
                     geoInfoSpan.classList.remove('geo-loading');
-                    
+
                     const blockedSpan = document.createElement('span');
                     blockedSpan.className = 'geo-blocked';
                     blockedSpan.textContent = '阻断IP';
@@ -1229,13 +967,13 @@ async function HTML() {
                       // 更新为实际的地理位置信息
                       geoInfoSpan.innerHTML = '';
                       geoInfoSpan.classList.remove('geo-loading');
-                      
+
                       // 添加国家信息
                       const countrySpan = document.createElement('span');
                       countrySpan.className = 'geo-country';
                       countrySpan.textContent = geoData.country || '未知国家';
                       geoInfoSpan.appendChild(countrySpan);
-                      
+
                       // 添加 AS 信息
                       const asSpan = document.createElement('span');
                       asSpan.className = 'geo-as';
@@ -1250,21 +988,21 @@ async function HTML() {
               }
             });
           }
-          
+
           // IPv6 记录
           const ipv6Records = data.ipv6?.records || [];
           const ipv6Container = document.getElementById('ipv6Records');
           ipv6Container.innerHTML = '';
-          
+
           if (ipv6Records.length === 0) {
             document.getElementById('ipv6Summary').innerHTML = \`<strong>未找到 IPv6 记录</strong>\`;
           } else {
             document.getElementById('ipv6Summary').innerHTML = \`<strong>找到 \${ipv6Records.length} 条 IPv6 记录</strong>\`;
-            
+
             ipv6Records.forEach(record => {
               const recordDiv = document.createElement('div');
               recordDiv.className = 'ip-record';
-              
+
               if (record.type === 5) { // CNAME 记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
@@ -1274,13 +1012,13 @@ async function HTML() {
                   </div>
                 \`;
                 ipv6Container.appendChild(recordDiv);
-                
+
                 // 添加点击事件
                 const copyElem = recordDiv.querySelector('.ip-address');
                 copyElem.addEventListener('click', function() {
                   handleCopyClick(this, this.getAttribute('data-copy'));
                 });
-                
+
               } else if (record.type === 28) {  // AAAA记录
                 recordDiv.innerHTML = \`
                   <div class="d-flex justify-content-between align-items-center">
@@ -1290,29 +1028,29 @@ async function HTML() {
                   </div>
                 \`;
                 ipv6Container.appendChild(recordDiv);
-                
+
                 // 添加点击事件
                 const copyElem = recordDiv.querySelector('.ip-address');
                 copyElem.addEventListener('click', function() {
                   handleCopyClick(this, this.getAttribute('data-copy'));
                 });
-                
+
                 // 添加地理位置信息
                 const geoInfoSpan = recordDiv.querySelector('.geo-info');
-                
+
                 // 检查是否为阻断IP
                 if (isBlockedIP(record.data)) {
                   // 异步查询 IP 地理位置信息获取AS信息
                   queryIpGeoInfo(record.data).then(geoData => {
                     geoInfoSpan.innerHTML = '';
                     geoInfoSpan.classList.remove('geo-loading');
-                    
+
                     // 显示阻断IP标识（替代国家信息）
                     const blockedSpan = document.createElement('span');
                     blockedSpan.className = 'geo-blocked';
                     blockedSpan.textContent = '阻断IP';
                     geoInfoSpan.appendChild(blockedSpan);
-                    
+
                     // 如果有AS信息，正常显示
                     if (geoData && geoData.status === 'success' && geoData.as) {
                       const asSpan = document.createElement('span');
@@ -1324,7 +1062,7 @@ async function HTML() {
                     // 查询失败时仍显示阻断IP标识
                     geoInfoSpan.innerHTML = '';
                     geoInfoSpan.classList.remove('geo-loading');
-                    
+
                     const blockedSpan = document.createElement('span');
                     blockedSpan.className = 'geo-blocked';
                     blockedSpan.textContent = '阻断IP';
@@ -1337,13 +1075,13 @@ async function HTML() {
                       // 更新为实际的地理位置信息
                       geoInfoSpan.innerHTML = '';
                       geoInfoSpan.classList.remove('geo-loading');
-                      
+
                       // 添加国家信息
                       const countrySpan = document.createElement('span');
                       countrySpan.className = 'geo-country';
                       countrySpan.textContent = geoData.country || '未知国家';
                       geoInfoSpan.appendChild(countrySpan);
-                      
+
                       // 添加 AS 信息
                       const asSpan = document.createElement('span');
                       asSpan.className = 'geo-as';
@@ -1358,21 +1096,21 @@ async function HTML() {
               }
             });
           }
-          
+
           // NS 记录
           const nsRecords = data.ns?.records || [];
           const nsContainer = document.getElementById('nsRecords');
           nsContainer.innerHTML = '';
-          
+
           if (nsRecords.length === 0) {
             document.getElementById('nsSummary').innerHTML = \`<strong>未找到 NS 记录</strong>\`;
           } else {
             document.getElementById('nsSummary').innerHTML = \`<strong>找到 \${nsRecords.length} 条名称服务器记录</strong>\`;
-            
+
             nsRecords.forEach(record => {
               const recordDiv = document.createElement('div');
               recordDiv.className = 'ip-record';
-              
+
               // 不同类型的记录使用不同的显示方式
               if (record.type === 2) {  // NS 记录
                 recordDiv.innerHTML = \`
@@ -1382,13 +1120,13 @@ async function HTML() {
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
                 \`;
-                
+
                 // 添加点击事件
                 const copyElem = recordDiv.querySelector('.ip-address');
                 copyElem.addEventListener('click', function() {
                   handleCopyClick(this, this.getAttribute('data-copy'));
                 });
-                
+
               } else if (record.type === 6) {  // SOA 记录
                 // SOA 记录格式: primary_ns admin_email serial refresh retry expire minimum
                 const soaParts = record.data.split(' ');
@@ -1410,7 +1148,7 @@ async function HTML() {
                     <div><strong>最小 TTL:</strong> \${formatTTL(soaParts[6])}</div>
                   </div>
                 \`;
-                
+
                 // 添加点击事件，为SOA记录中的所有可点击元素添加事件
                 const copyElems = recordDiv.querySelectorAll('.ip-address');
                 copyElems.forEach(elem => {
@@ -1418,7 +1156,7 @@ async function HTML() {
                     handleCopyClick(this, this.getAttribute('data-copy'));
                   });
                 });
-                
+
               } else {
                 // 其他类型的记录
                 recordDiv.innerHTML = \`
@@ -1428,31 +1166,31 @@ async function HTML() {
                     <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
                   </div>
                 \`;
-                
+
                 // 添加点击事件
                 const copyElem = recordDiv.querySelector('.ip-address');
                 copyElem.addEventListener('click', function() {
                   handleCopyClick(this, this.getAttribute('data-copy'));
                 });
               }
-              
+
               nsContainer.appendChild(recordDiv);
             });
           }
-          
+
           // 当用户切换到IPv4或IPv6选项卡时，确保显示已加载的地理位置信息
           document.getElementById('ipv4-tab').addEventListener('click', function() {
             // 如果还有加载中的地理位置信息，可以在这里处理
           });
-          
+
           document.getElementById('ipv6-tab').addEventListener('click', function() {
             // 如果还有加载中的地理位置信息，可以在这里处理
           });
-          
+
           // 显示复制按钮
           document.getElementById('copyBtn').style.display = 'block';
         }
-        
+
         // 显示错误
         function displayError(message) {
           document.getElementById('resultContainer').style.display = 'none';
@@ -1460,13 +1198,13 @@ async function HTML() {
           document.getElementById('errorMessage').textContent = message;
           document.getElementById('copyBtn').style.display = 'none';
         }
-        
+
         // 表单提交后发起 DNS 查询请求
         document.getElementById('resolveForm').addEventListener('submit', async function(e) {
           e.preventDefault();
           const dohSelect = document.getElementById('dohSelect').value;
           let doh;
-          
+
           if(dohSelect === 'current') {
             doh = currentDohUrl;
           } else if(dohSelect === 'custom') {
@@ -1478,29 +1216,29 @@ async function HTML() {
           } else {
             doh = dohSelect;
           }
-          
+
           const domain = document.getElementById('domain').value;
           if (!domain) {
             alert('请输入需要解析的域名');
             return;
           }
-          
+
           // 显示加载状态
           document.getElementById('loading').style.display = 'block';
           document.getElementById('resultContainer').style.display = 'none';
           document.getElementById('errorContainer').style.display = 'none';
           document.getElementById('copyBtn').style.display = 'none';
-          
+
           try {
             // 发起查询，参数采用 GET 请求方式，type=all 表示同时查询 A 和 AAAA
             const response = await fetch(\`?doh=\${encodeURIComponent(doh)}&domain=\${encodeURIComponent(domain)}&type=all\`);
-            
+
             if (!response.ok) {
               throw new Error(\`HTTP 错误: \${response.status}\`);
             }
-            
+
             const json = await response.json();
-            
+
             // 检查响应是否包含错误
             if (json.error) {
               displayError(json.error);
@@ -1514,7 +1252,7 @@ async function HTML() {
             document.getElementById('loading').style.display = 'none';
           }
         });
-        
+
         // 页面加载完成后执行
         document.addEventListener('DOMContentLoaded', function() {
           // 使用本地存储记住最后使用的域名
@@ -1522,7 +1260,7 @@ async function HTML() {
           if (lastDomain) {
             document.getElementById('domain').value = lastDomain;
           }
-          
+
           // 监听域名输入变化并保存
           document.getElementById('domain').addEventListener('input', function() {
             localStorage.setItem('lastDomain', this.value);
@@ -1530,13 +1268,13 @@ async function HTML() {
 
           // 更新显示当前域名
           document.getElementById('currentDomain').textContent = currentHost;
-          
+
           // 更新DoH下拉选择框的自动选项，显示完整URL
           const currentDohOption = document.getElementById('currentDohOption');
           if (currentDohOption) {
             currentDohOption.textContent = currentDohUrl + ' (当前站点)';
           }
-          
+
           // 设置DoH链接复制功能
           const dohUrlDisplay = document.getElementById('dohUrlDisplay');
           if (dohUrlDisplay) {
@@ -1557,7 +1295,7 @@ async function HTML() {
           document.getElementById('getJsonBtn').addEventListener('click', function() {
             const dohSelect = document.getElementById('dohSelect').value;
             let dohUrl;
-            
+
             // 获取当前选择的DoH服务器URL
             if(dohSelect === 'current') {
               dohUrl = currentDohUrl;
@@ -1570,19 +1308,19 @@ async function HTML() {
             } else {
               dohUrl = dohSelect;
             }
-            
+
             // 获取域名
             const domain = document.getElementById('domain').value;
             if (!domain) {
               alert('请输入需要解析的域名');
               return;
             }
-            
+
             // 构建完整的查询URL
             let jsonUrl = new URL(dohUrl);
             // 使用name参数(标准DNS-JSON格式)
             jsonUrl.searchParams.set('name', domain);
-            
+
             // 在新标签页打开
             window.open(jsonUrl.toString(), '_blank');
           });
@@ -1670,12 +1408,12 @@ async function nginx() {
 	<h1>Welcome to nginx!</h1>
 	<p>If you see this page, the nginx web server is successfully installed and
 	working. Further configuration is required.</p>
-	
+
 	<p>For online documentation and support please refer to
 	<a href="http://nginx.org/">nginx.org</a>.<br/>
 	Commercial support is available at
 	<a href="http://nginx.com/">nginx.com</a>.</p>
-	
+
 	<p><em>Thank you for using nginx.</em></p>
 	</body>
 	</html>
